@@ -3,28 +3,19 @@ package missingcrypt
 import (
 	"crypto/cipher"
 	"encoding/binary"
+	"math/bits"
 )
 
-// mcryptSeedCipher is a non-standard SEED-128 block cipher matching the game's
-// implementation. Differences from RFC 4269 SEED:
-//   - T1 uses K1+K3+RC (standard is K1-K3+RC)
-//   - Block I/O uses big-endian byte order
-//   - 4-word Feistel: state rotates (v5,v7,result,v9); F operates on (result,v9)
-//
-// Note: all observed SEED traffic uses bigEndianHeader=true. In that mode the
-// game applies bswap32 before each G() call (in both key schedule and round
-// function). The binary tables at C874/CC74/D074/D474 match SS0/SS1/SS2/SS3,
-// so the effective function is:
-//
-//	G_eff(x) = SS0[x&0xFF] ^ SS1[(x>>8)&0xFF] ^ SS2[(x>>16)&0xFF] ^ SS3[(x>>24)&0xFF]
-//
-// mcryptSeedG implements G_eff directly; no bswap is applied at call sites.
+// The implementation differs from standard SEED in three places:
+//   - round key T1 uses B + D + KC[i] instead of B - D + KC[i]
+//   - block I/O is always big-endian
+//   - the 4-word state rotates as (w0,w1,w2,w3) -> (w2,w3,...) each round
 type mcryptSeedCipher struct {
 	Keys [32]uint32 `json:"keys"`
 }
 
 func newMcryptSeed(key []byte) cipher.Block {
-	c := new(mcryptSeedCipher)
+	c := &mcryptSeedCipher{}
 	c.expandKey(key)
 	return c
 }
@@ -32,108 +23,93 @@ func newMcryptSeed(key []byte) cipher.Block {
 func (c *mcryptSeedCipher) BlockSize() int { return 16 }
 
 func (c *mcryptSeedCipher) expandKey(key []byte) {
-	// Key words read as little-endian uint32 (LE ARM64: v2.n64_u64[0]=*a2)
-	A := binary.LittleEndian.Uint32(key[0:])
-	B := binary.LittleEndian.Uint32(key[4:])
-	C := binary.LittleEndian.Uint32(key[8:])
-	D := binary.LittleEndian.Uint32(key[12:])
+	A := binary.LittleEndian.Uint32(key[0:4])
+	B := binary.LittleEndian.Uint32(key[4:8])
+	C := binary.LittleEndian.Uint32(key[8:12])
+	D := binary.LittleEndian.Uint32(key[12:16])
 
 	for i := 0; i < 16; i++ {
 		rc := mcryptSeedKC[i]
 		T0 := A + C - rc
-		T1 := B + D + rc // non-standard: +D instead of -D
+		T1 := B + D + rc
 		c.Keys[i*2] = mcryptSeedG(T0)
 		c.Keys[i*2+1] = mcryptSeedG(T1)
 
-		if i%2 == 0 {
-			// ROR64(A:B, 8)
+		if i&1 == 0 {
 			oldA := A
 			A = (A >> 8) | (B << 24)
 			B = (B >> 8) | (oldA << 24)
-		} else {
-			// ROL64(C:D, 8)
-			oldC := C
-			C = (C << 8) | (D >> 24)
-			D = (D << 8) | (oldC >> 24)
+			continue
 		}
+		oldC := C
+		C = (C << 8) | (D >> 24)
+		D = (D << 8) | (oldC >> 24)
 	}
 }
 
 func (c *mcryptSeedCipher) Encrypt(dst, src []byte) {
-	// Block I/O in big-endian byte order (flag=1 path, always active)
-	// State: v5=word0, v7=word1, res=word2, v9=word3
-	v5 := binary.BigEndian.Uint32(src[0:4])
-	v7 := binary.BigEndian.Uint32(src[4:8])
-	res := binary.BigEndian.Uint32(src[8:12])
-	v9 := binary.BigEndian.Uint32(src[12:16])
+	w0 := binary.BigEndian.Uint32(src[0:4])
+	w1 := binary.BigEndian.Uint32(src[4:8])
+	w2 := binary.BigEndian.Uint32(src[8:12])
+	w3 := binary.BigEndian.Uint32(src[12:16])
 
-	for keyIdx := 0; keyIdx < 32; keyIdx += 2 {
-		// State rotation: save (v7,v5), advance to (v9,res)
-		v11 := v7
-		v7 = v9
-		v12 := v5
-		v5 = res
-		// F(res, new_v7) with keys
-		t0 := c.Keys[keyIdx] ^ res   // T0 = K0 ^ old res
-		t1 := c.Keys[keyIdx+1] ^ v7  // K1 ^ new v7 (= old v9)
-		t0, t1 = mcryptSeedF(t0, t1) // returns (E+C, E)
-		res = t0 ^ v12               // (E+C) ^ old v5
-		v9 = t1 ^ v11                // E ^ old v7
+	for keyIdx := 0; keyIdx < len(c.Keys); keyIdx += 2 {
+		prevW1 := w1
+		w1 = w3
+		prevW0 := w0
+		w0 = w2
+		out0, out1 := mcryptSeedF(c.Keys[keyIdx], c.Keys[keyIdx+1], w2, w1)
+		w2 = out0 ^ prevW0
+		w3 = out1 ^ prevW1
 	}
 
-	binary.BigEndian.PutUint32(dst[0:4], res)
-	binary.BigEndian.PutUint32(dst[4:8], v9)
-	binary.BigEndian.PutUint32(dst[8:12], v5)
-	binary.BigEndian.PutUint32(dst[12:16], v7)
+	binary.BigEndian.PutUint32(dst[0:4], w2)
+	binary.BigEndian.PutUint32(dst[4:8], w3)
+	binary.BigEndian.PutUint32(dst[8:12], w0)
+	binary.BigEndian.PutUint32(dst[12:16], w1)
 }
 
 func (c *mcryptSeedCipher) Decrypt(dst, src []byte) {
-	// Block I/O in big-endian byte order (flag=1 path, always active)
-	// State: v4=word0, v8=word1, v9=word2, v10=word3
-	v4 := binary.BigEndian.Uint32(src[0:4])
-	v8 := binary.BigEndian.Uint32(src[4:8])
-	v9 := binary.BigEndian.Uint32(src[8:12])
-	v10 := binary.BigEndian.Uint32(src[12:16])
+	w0 := binary.BigEndian.Uint32(src[0:4])
+	w1 := binary.BigEndian.Uint32(src[4:8])
+	w2 := binary.BigEndian.Uint32(src[8:12])
+	w3 := binary.BigEndian.Uint32(src[12:16])
 
-	for keyIdx := 30; keyIdx >= 0; keyIdx -= 2 {
-		// State rotation: save (v8,v4), advance to (v10,v9)
-		v11 := v8
-		v8 = v10
-		v12 := v4
-		v4 = v9
-		// F(v9, new_v8) with keys (same computation as encrypt)
-		t0 := c.Keys[keyIdx] ^ v9    // T0 = K0 ^ old v9
-		t1 := c.Keys[keyIdx+1] ^ v8  // K1 ^ new v8 (= old v10)
-		t0, t1 = mcryptSeedF(t0, t1) // returns (E+C, E)
-		v9 = t0 ^ v12                // (E+C) ^ old v4
-		v10 = t1 ^ v11               // E ^ old v8
+	for keyIdx := len(c.Keys) - 2; keyIdx >= 0; keyIdx -= 2 {
+		prevW1 := w1
+		w1 = w3
+		prevW0 := w0
+		w0 = w2
+		out0, out1 := mcryptSeedF(c.Keys[keyIdx], c.Keys[keyIdx+1], w2, w1)
+		w2 = out0 ^ prevW0
+		w3 = out1 ^ prevW1
 	}
 
-	binary.BigEndian.PutUint32(dst[0:4], v9)
-	binary.BigEndian.PutUint32(dst[4:8], v10)
-	binary.BigEndian.PutUint32(dst[8:12], v4)
-	binary.BigEndian.PutUint32(dst[12:16], v8)
+	binary.BigEndian.PutUint32(dst[0:4], w2)
+	binary.BigEndian.PutUint32(dst[4:8], w3)
+	binary.BigEndian.PutUint32(dst[8:12], w0)
+	binary.BigEndian.PutUint32(dst[12:16], w1)
 }
 
+// The SEED object built by sub_70282AA09C always sets its "big-endian" flag,
+// so every G() input is byte-swapped before the binary's table lookup.
 func mcryptSeedG(n uint32) uint32 {
-	return mcryptSeedSS0[n&0xFF] ^ mcryptSeedSS1[(n>>8)&0xFF] ^ mcryptSeedSS2[(n>>16)&0xFF] ^ mcryptSeedSS3[(n>>24)&0xFF]
+	n = bits.ReverseBytes32(n)
+	return mcryptSeedSS1[(n>>16)&0xFF] ^
+		mcryptSeedSS0[(n>>24)&0xFF] ^
+		mcryptSeedSS2[(n>>8)&0xFF] ^
+		mcryptSeedSS3[n&0xFF]
 }
 
-// mcryptSeedF is the Feistel F function. Returns (E+C, E) where:
-//
-//	Txor = t0^t1, A = G(Txor), B = A+T0, C = G(B), D = C+A, E = G(D)
-func mcryptSeedF(t0, t1 uint32) (uint32, uint32) {
-	t1 ^= t0
-	t1 = mcryptSeedG(t1) // A
-	t0 += t1
-	t0 = mcryptSeedG(t0) // C
-	t1 += t0
-	t1 = mcryptSeedG(t1) // E
-	t0 += t1             // C+E = E+C
-	return t0, t1
+func mcryptSeedF(k0, k1, right0, right1 uint32) (uint32, uint32) {
+	t0 := k0 ^ right0
+	t1 := k1 ^ right1 ^ t0
+	g0 := mcryptSeedG(t1)
+	g1 := mcryptSeedG(g0 + t0)
+	g2 := mcryptSeedG(g1 + g0)
+	return g2 + g1, g2
 }
 
-// Standard SEED round constants and S-boxes (RFC 4269).
 var mcryptSeedKC = [...]uint32{
 	0x9e3779b9, 0x3c6ef373, 0x78dde6e6, 0xf1bbcdcc, 0xe3779b99, 0xc6ef3733, 0x8dde6e67, 0x1bbcdccf,
 	0x3779b99e, 0x6ef3733c, 0xdde6e678, 0xbbcdccf1, 0x779b99e3, 0xef3733c6, 0xde6e678d, 0xbcdccf1b,
@@ -206,7 +182,7 @@ var mcryptSeedSS1 = [256]uint32{
 	0x30300030, 0x94158591, 0x64254561, 0x3c3c0c30, 0xb43686b2, 0xe424c4e0, 0xb83b8bb3, 0x7c3c4c70,
 	0x0c0e0e02, 0x50104050, 0x38390931, 0x24260622, 0x30320232, 0x84048480, 0x68294961, 0x90138393,
 	0x34370733, 0xe427c7e3, 0x24240420, 0xa42484a0, 0xc80bcbc3, 0x50134353, 0x080a0a02, 0x84078783,
-	0xd819c9d1, 0x4c0c4c40, 0x80038383, 0x8c0f8f83, 0xcc0ecec2, 0x383b0b33, 0x4a42480a, 0xb43787b3,
+	0xd819c9d1, 0x4c0c4c40, 0x80038383, 0x8c0f8f83, 0xcc0ecec2, 0x383b0b33, 0x480a4a42, 0xb43787b3,
 }
 
 var mcryptSeedSS2 = [256]uint32{
@@ -276,5 +252,5 @@ var mcryptSeedSS3 = [256]uint32{
 	0x00303030, 0x85919415, 0x45616425, 0x0c303c3c, 0x86b2b436, 0xc4e0e424, 0x8bb3b83b, 0x4c707c3c,
 	0x0e020c0e, 0x40505010, 0x09313839, 0x06222426, 0x02323032, 0x84808404, 0x49616829, 0x83939013,
 	0x07333437, 0xc7e3e427, 0x04202424, 0x84a0a424, 0xcbc3c80b, 0x43535013, 0x0a02080a, 0x87838407,
-	0xc9d1d819, 0x4c404c0c, 0x83838003, 0x8f838c0f, 0xcec2cc0e, 0x0b33383b, 0x480a4a42, 0x87b3b437,
+	0xc9d1d819, 0x4c404c0c, 0x83838003, 0x8f838c0f, 0xcec2cc0e, 0x0b33383b, 0x4a42480a, 0x87b3b437,
 }
