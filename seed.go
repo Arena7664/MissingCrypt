@@ -54,13 +54,11 @@ func (c *mcryptSeedCipher) Encrypt(dst, src []byte) {
 	w3 := binary.BigEndian.Uint32(src[12:16])
 
 	for keyIdx := 0; keyIdx < len(c.Keys); keyIdx += 2 {
-		prevW1 := w1
-		w1 = w3
-		prevW0 := w0
-		w0 = w2
+		oldW0, oldW1 := w0, w1
+		w0, w1 = w2, w3
 		out0, out1 := mcryptSeedF(c.Keys[keyIdx], c.Keys[keyIdx+1], w2, w1)
-		w2 = out0 ^ prevW0
-		w3 = out1 ^ prevW1
+		w2 = out0 ^ oldW0
+		w3 = out1 ^ oldW1
 	}
 
 	binary.BigEndian.PutUint32(dst[0:4], w2)
@@ -76,13 +74,11 @@ func (c *mcryptSeedCipher) Decrypt(dst, src []byte) {
 	w3 := binary.BigEndian.Uint32(src[12:16])
 
 	for keyIdx := len(c.Keys) - 2; keyIdx >= 0; keyIdx -= 2 {
-		prevW1 := w1
-		w1 = w3
-		prevW0 := w0
-		w0 = w2
+		oldW0, oldW1 := w0, w1
+		w0, w1 = w2, w3
 		out0, out1 := mcryptSeedF(c.Keys[keyIdx], c.Keys[keyIdx+1], w2, w1)
-		w2 = out0 ^ prevW0
-		w3 = out1 ^ prevW1
+		w2 = out0 ^ oldW0
+		w3 = out1 ^ oldW1
 	}
 
 	binary.BigEndian.PutUint32(dst[0:4], w2)
@@ -91,8 +87,8 @@ func (c *mcryptSeedCipher) Decrypt(dst, src []byte) {
 	binary.BigEndian.PutUint32(dst[12:16], w1)
 }
 
-// The SEED object built by sub_70282AA09C always sets its "big-endian" flag,
-// so every G() input is byte-swapped before the binary's table lookup.
+// The original binary always enables big-endian mode, so each G() input is
+// byte-swapped before hitting the S-box tables.
 func mcryptSeedG(n uint32) uint32 {
 	n = bits.ReverseBytes32(n)
 	return mcryptSeedSS1[(n>>16)&0xFF] ^
